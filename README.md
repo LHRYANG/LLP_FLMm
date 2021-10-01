@@ -11,7 +11,7 @@ Thank him for sharing the code.
 1. Download the pretrained feature extractor weight from [here](https://drive.google.com/drive/folders/1d96DTXOdnI_MmgH1bR_fCdgU1swAZycD?usp=sharing)</br>
 `(100_512_1000.pth: CIFAR100, batch_size 512, training epochs 1000, 10_512_1000: CIFAR10)` </br>
 Or you can train it by your own following the guidence in [SupContrast](https://github.com/HobbitLong/SupContrast) </br>and make sure you take the SimCLR method instead of Supervised Contrastive learning method.
-2. `python main.py --learning_rate 1 --packet_size 128  --t1 0.001 --t2 0.001 --acc_save_path acc.pkl --epochs 200`
+2. `python main.py --learning_rate 1 --packet_size 128  --ckpt pretrain_feature_extractor --dataset cifar100 --thre 0.01 --thre2 0.01 --acc_save_path acc.pkl --epochs 200`
 3. As for `Ours without FLMm`, you can just comment out the following code in function `train()` in `main.py` </br>
 to get a similar results.
 
