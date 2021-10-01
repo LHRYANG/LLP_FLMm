@@ -1,7 +1,10 @@
 # LLP_FLMm
-Implementation for Paper  LLP_FLMm
+Implementation for ACML 2021 paper **A Two-Stage Training Framework with Feature-Label Matching
+Mechanism for Learning from Label Proportions**
 
-Most of this code is based on the [SupContrast](https://github.com/HobbitLong/SupContrast) code by  HobbitLong.</br>
+We use the code implemented by [HobbitLong](https://github.com/HobbitLong/SupContrast) to train the feature extractor.
+
+Part of the code is borrowed from [kuangliu](https://github.com/kuangliu/pytorch-cifar).
 Thank him for sharing the code. 
 
 ## How to run
