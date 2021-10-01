@@ -8,12 +8,13 @@ import math
 import torch
 import torch.backends.cudnn as cudnn
 import torch.nn.functional as F
+from main_ce import set_loader
 from util import AverageMeter
 from util import adjust_learning_rate, warmup_learning_rate, accuracy
 from util import set_optimizer
 from networks.resnet_big import SupConResNet, LinearClassifier
-from torchvision import transforms, datasets
 import torch.nn as nn
+from collections import Counter
 import pickle
 try:
     import apex
@@ -23,71 +24,34 @@ except ImportError:
 
 
 def get_label_proportion(labels,num_class,packet_size):
-    batch_size = labels.shape[0]//packet_size
+    if labels.shape[0]% packet_size== 0:
+        batch_size = labels.shape[0]//packet_size
+        #print(batch_size)
+    else:
+        batch_size = labels.shape[0] // packet_size + 1
+
     distribution = torch.zeros(batch_size,num_class)
+    #print(distribution.shape)
+    #print(distribution.shape)
     for idx,label in enumerate(labels):
         distribution[idx//packet_size,label]+=1
-    
-    distribution = distribution / packet_size
+    if labels.shape[0]% packet_size== 0:
+        distribution = distribution / packet_size
+    else:
+        for i in range(batch_size-1):
+            distribution[i] = distribution[i]/packet_size
+        distribution[-1] = distribution[-1]/(labels.shape[0]-packet_size*(labels.shape[0]//packet_size))
+    #print(distribution)
+    #print(torch.sum(distribution,dim=1))
     return distribution
-
-def set_loader(opt):
-    # construct data loader
-    if opt.dataset == 'cifar10':
-        mean = (0.4914, 0.4822, 0.4465)
-        std = (0.2023, 0.1994, 0.2010)
-    elif opt.dataset == 'cifar100':
-        mean = (0.5071, 0.4867, 0.4408)
-        std = (0.2675, 0.2565, 0.2761)
-    else:
-        raise ValueError('dataset not supported: {}'.format(opt.dataset))
-    normalize = transforms.Normalize(mean=mean, std=std)
-
-    train_transform = transforms.Compose([
-        transforms.RandomResizedCrop(size=32, scale=(0.2, 1.)),
-        transforms.RandomHorizontalFlip(),
-        transforms.ToTensor(),
-        normalize,
-    ])
-
-    val_transform = transforms.Compose([
-        transforms.ToTensor(),
-        normalize,
-    ])
-
-    if opt.dataset == 'cifar10':
-        train_dataset = datasets.CIFAR10(root=opt.data_folder,
-                                         transform=train_transform,
-                                         download=True)
-        val_dataset = datasets.CIFAR10(root=opt.data_folder,
-                                       train=False,
-                                       transform=val_transform)
-    elif opt.dataset == 'cifar100':
-        train_dataset = datasets.CIFAR100(root=opt.data_folder,
-                                          transform=train_transform,
-                                          download=True)
-        val_dataset = datasets.CIFAR100(root=opt.data_folder,
-                                        train=False,
-                                        transform=val_transform)
-    else:
-        raise ValueError(opt.dataset)
-
-    train_sampler = None
-    train_loader = torch.utils.data.DataLoader(
-        train_dataset, batch_size=opt.batch_size, shuffle=(train_sampler is None),
-        num_workers=opt.num_workers, pin_memory=True, sampler=train_sampler)
-    val_loader = torch.utils.data.DataLoader(
-        val_dataset, batch_size=opt.batch_size, shuffle=False,
-        num_workers=8, pin_memory=True)
-
-    return train_loader, val_loader
-
 
 def parse_option():
     parser = argparse.ArgumentParser('argument for training')
 
     parser.add_argument('--print_freq', type=int, default=10,
                         help='print frequency')
+    parser.add_argument('--save_freq', type=int, default=50,
+                        help='save frequency')
     parser.add_argument('--batch_size', type=int, default=1024,
                         help='batch_size')
     parser.add_argument('--num_workers', type=int, default=16,
@@ -119,13 +83,15 @@ def parse_option():
     parser.add_argument('--warm', action='store_true',
                         help='warm-up for large batch training')
 
-    parser.add_argument('--ckpt', type=str, default='../LLP-GAN-master/SimCLR/100_512_1000.pth',
+    parser.add_argument('--ckpt', type=str, default='100_512_1000.pth',
                         help='path to pre-trained model')
 
-    parser.add_argument('--t1', type=float, default=0.03,
+    parser.add_argument('--sample_size', type=int, default=20,
+                        help='choose how many samples to optimize')
+    parser.add_argument('--thre', type=float, default=0.03,
                         help='choose how many samples to optimize')
 
-    parser.add_argument('--t2', type=float, default=0.03,
+    parser.add_argument('--thre2', type=float, default=0.03,
                         help='choose how many samples to optimize')
 
     parser.add_argument('--model_save_path', type=str, default="model.pkl")
@@ -169,6 +135,19 @@ def parse_option():
 
     return opt
 
+class new_classifier(nn.Module):
+    def __init__(self,num_class):
+        super(new_classifier, self).__init__()
+        self.relu = nn.ReLU()
+        self.W1 = nn.Linear(2048,1024)
+        self.W2 = nn.Linear(1024,num_class)
+    def forward(self,feature,adj):
+        #f[b,p,2048] adj[b,p,p]
+        f = torch.matmul(adj,feature)
+        f = self.relu(self.W1(f))
+        f = self.W2(f)
+
+        return f
 
 class HLoss(nn.Module):
     def __init__(self):
@@ -181,9 +160,10 @@ class HLoss(nn.Module):
 
 def set_model(opt):
     model = SupConResNet(name=opt.model)
-    criterion = nn.KLDivLoss()
+    criterion = torch.nn.CrossEntropyLoss()
 
     classifier = LinearClassifier(name=opt.model, num_classes=opt.n_cls)
+    #classifier = new_classifier(num_class=opt.n_cls)
     ckpt = torch.load(opt.ckpt, map_location='cpu')
     state_dict = ckpt['model']
 
@@ -200,6 +180,7 @@ def set_model(opt):
         classifier = classifier.cuda()
         criterion = criterion.cuda()
         cudnn.benchmark = True
+
         model.load_state_dict(state_dict)
 
     return model, classifier, criterion
@@ -210,7 +191,7 @@ def train(train_loader, model, classifier, criterion, optimizer, epoch, opt):
     entropy = HLoss()
     model.eval()
     classifier.train()
-    
+    criterion = nn.KLDivLoss()
     batch_time = AverageMeter()
     data_time = AverageMeter()
     losses = AverageMeter()
@@ -221,13 +202,22 @@ def train(train_loader, model, classifier, criterion, optimizer, epoch, opt):
         data_time.update(time.time() - end)
         if labels.shape[0]!=1024:
             break
+        #print(labels.shape)
         distribution = get_label_proportion(labels, num_class=opt.n_cls, packet_size=opt.packet_size)
 
-        # obtain class bigger than t1, process batch of bags
+        # obtain class bigger than thre, process batch of bags
         threshold_label = []
         for r in distribution:
-            threshold_label.append((r>opt.t1).nonzero().reshape(-1).tolist())
-        
+            thre_list = []
+            for lal,c in enumerate(r):
+                if c>opt.thre: #0.03:
+                    thre_list.append(lal)
+            #if not thre_list:
+                #_,top3 = torch.topk(r,3)
+                #thre_list.extend(top3.tolist())
+            threshold_label.append(thre_list)
+        #threshold_label tells which labels are greater than a threshold
+
         images = images.cuda(non_blocking=True)
         labels = labels.cuda(non_blocking=True)
         distribution = distribution.cuda()
@@ -243,28 +233,31 @@ def train(train_loader, model, classifier, criterion, optimizer, epoch, opt):
         outputs = F.softmax(output, dim=-1)
 
         entropy_loss = entropy(output)/(output.shape[0]*output.shape[1])
-
-        _, plabel = torch.topk(outputs,1,dim=1)
-        plabel = plabel.unsqueeze(1)#[1,1024]
-        reshape_plabel = torch.reshape(plabel,(int(1024 / opt.packet_size), opt.packet_size))#[B,bag]
+        #print(entropy_loss)
+        _, c_idx = torch.topk(outputs,1,dim=1)
+        c_idx = c_idx.unsqueeze(1)#[1,1024]
+        reshape_c_idx = torch.reshape(c_idx,(int(1024 / opt.packet_size), opt.packet_size))#[B,bag]
         outputs = torch.reshape(outputs, (int(1024 / opt.packet_size), opt.packet_size, -1))#[b,p,100]
 
         outputs = torch.mean(outputs, dim=1)
 
 
         statistic_label = torch.zeros(int(1024 / opt.packet_size),opt.n_cls)
-        for r, rr in enumerate(reshape_plabel):
+        for r, rr in enumerate(reshape_c_idx):
             for cc in rr:
                 statistic_label[r][cc]+=1
+        #value,top = torch.topk(statistic_label,5)
+
         
         batch_features = []
         for r, rr in enumerate(statistic_label):
             bag_features = []
             for c, c_fre in enumerate(rr):
-                if c_fre >= opt.packet_size*opt.t2:
-                    for ttt, lal in enumerate(reshape_plabel[r]):
+                if c_fre >= opt.packet_size*opt.thre2:
+                    for ttt, lal in enumerate(reshape_c_idx[r]):
                         if lal == c:
                             bag_features.append(reshape_features[r][ttt])
+           
             batch_features.append(bag_features)
 
         outputs = torch.log(outputs)
@@ -274,6 +267,9 @@ def train(train_loader, model, classifier, criterion, optimizer, epoch, opt):
         entropy_losses.update(entropy_loss.item(),bsz)
         acc1, acc5 = accuracy(output, labels, topk=(1, 5))
         top1.update(acc1[0], bsz)
+        #print(loss)
+        #print(entropy_loss)
+        # SGD
         total_loss = loss+0.01*entropy_loss
         optimizer.zero_grad()
         total_loss.backward()
@@ -294,31 +290,37 @@ def train(train_loader, model, classifier, criterion, optimizer, epoch, opt):
                    epoch, idx + 1, len(train_loader), batch_time=batch_time,
                    data_time=data_time, loss=losses, ent_loss=entropy_losses, top1=top1))
             sys.stdout.flush()
-       
+        # ------------------------------------------
 
         nll_loss = nn.NLLLoss()
         for r in range(int(1024/opt.packet_size)):
             if not threshold_label[r] or not batch_features[r]:
                 continue
             for lal in threshold_label[r]:
+                #print(threshold_label)
                 curt_bag_feature = batch_features[r]
                 f = torch.stack(curt_bag_feature).cuda()
                 tar = torch.tensor([lal for kkk in range(f.shape[0])],dtype=torch.long).cuda()
+                #f = cons_features[r] #[20,2048]
                 output = classifier(f.detach())  # [1024,10]
                 outputs = F.log_softmax(output,dim=-1)
                 nll = 0.0005*nll_loss(outputs,tar)
                 optimizer.zero_grad()
+                #print(nll)
                 nll.backward()
                 optimizer.step()
+                #print(outputs.shape)
+
+        # ------------------------------------------
 
     return losses.avg, top1.avg
 
 
-def validate(val_loader, model, classifier, opt):
+def validate(val_loader, model, classifier, criterion, opt):
     """validation"""
     model.eval()
     classifier.eval()
-    criterion = nn.CrossEntropyLoss()
+
     batch_time = AverageMeter()
     losses = AverageMeter()
     top1 = AverageMeter()
@@ -332,9 +334,26 @@ def validate(val_loader, model, classifier, opt):
                 break
             bsz = labels.shape[0]
 
+            #add
             features = model.encoder(images)  # [1024,2048]
-            output = classifier(features)
+            #print(features.shape)
+            #feat = F.normalize(features, dim=1)
+            #reshape_features = torch.reshape(feat, (int(1024 / opt.packet_size), opt.packet_size, -1))
+            #similarity_1 = torch.matmul(reshape_features, torch.transpose(reshape_features, 1, 2))
+            #tempA = 1 / torch.sum(similarity_1, 2)
+            #A = torch.zeros(int(1024 / opt.packet_size), opt.packet_size, opt.packet_size).cuda()
+            #A[:, range(A.shape[1]), range(A.shape[1])] = tempA[:]
+            #A = torch.sqrt(A)
+            #A = torch.matmul(torch.matmul(A, similarity_1), A)
+            #print(features.shape)
+            #reshape_features = torch.reshape(features, (int(1024 / opt.packet_size), opt.packet_size, -1))
 
+            # forward
+            #output = classifier(model.encoder(images))
+            #print(reshape_features.shape)
+            #print(A.shape)
+            output = classifier(features)
+            #output = output.reshape(1024,-1)#add
             loss = criterion(output, labels)
 
             # update metric
@@ -362,10 +381,16 @@ def main():
     best_acc = 0
     opt = parse_option()
 
+    # build data loader
     train_loader, val_loader = set_loader(opt)
+
+    # build model and criterion
     model, classifier, criterion = set_model(opt)
+
+    # build optimizer
     optimizer = set_optimizer(opt, classifier)
 
+    # training routine
     acc_list = []
     for epoch in range(1, opt.epochs + 1):
         adjust_learning_rate(opt, optimizer, epoch)
@@ -380,7 +405,7 @@ def main():
             epoch, time2 - time1, acc))
 
         # eval for one epoch
-        loss, val_acc = validate(val_loader, model, classifier, opt)
+        loss, val_acc = validate(val_loader, model, classifier, criterion, opt)
         acc_list.append(val_acc.cpu().numpy())
         if val_acc > best_acc:
             best_acc = val_acc
