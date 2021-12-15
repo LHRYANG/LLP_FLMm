@@ -1,6 +1,6 @@
 # LLP_FLMm
-Implementation for ACML 2021 paper **A Two-Stage Training Framework with Feature-Label Matching
-Mechanism for Learning from Label Proportions**
+Implementation for ACML 2021 paper **[A Two-Stage Training Framework with Feature-Label Matching
+Mechanism for Learning from Label Proportions](https://proceedings.mlr.press/v157/yang21b.html)**
 
 We use the code implemented by [HobbitLong](https://github.com/HobbitLong/SupContrast) to train the feature extractor.
 
